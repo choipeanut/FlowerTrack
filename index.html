@@ -183,7 +183,7 @@
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
 
   <script>
-    // ─── 요소 참조 ────────────────────────────────────────────────────
+    // ─── 요소 참조 ───────────────────────────────────────────────────
     const video       = document.getElementById('flowerVideo');
     const webcamVideo = document.getElementById('webcamVideo');
     const camCanvas   = document.getElementById('camCanvas');
@@ -192,122 +192,112 @@
     const gaugePercent= document.getElementById('gaugePercent');
     const noHandMsg   = document.getElementById('noHandMsg');
 
-    // ─── 상태 변수 ────────────────────────────────────────────────────
-    const ALPHA        = 0.12;   // EMA 스무딩 계수
-    const LERP_TIME    = 0.10;   // currentTime lerp 계수
-    const DECAY_RATE   = 0.95;   // NO_HAND 상태 감쇠 비율
+    // ─── 프레임 추출용 캔버스 (메인 디스플레이) ──────────────────────
+    const flowerCanvas = document.createElement('canvas');
+    const flowerCtx    = flowerCanvas.getContext('2d');
+    flowerCanvas.style.cssText = 'max-width:100%;max-height:100%;width:auto;height:100%;object-fit:contain;display:block;';
+    video.parentNode.replaceChild(flowerCanvas, video);
 
-    let smoothedOpenness  = 0;
-    let currentDisplayTime = 0;
-    let handState = 'NO_HAND';   // 'NO_HAND' | 'TRACKING'
-    let latestLandmarks = null;
+    // ─── 상태 변수 ───────────────────────────────────────────────────
+    const ALPHA      = 0.15;
+    const DECAY_RATE = 0.92;
 
-    // ─── 비디오 초기화 ────────────────────────────────────────────────
-    video.addEventListener('loadedmetadata', () => {
-      video.currentTime = 0;
-    });
-    // seeked 이벤트로 인한 프레임 갱신 지연을 최소화하기 위해 muted 유지
-    video.pause();
+    let smoothedOpenness = 0;
+    let smoothedIndex    = 0;
+    let handState        = 'NO_HAND';
+    let latestLandmarks  = null;
+    let frames           = [];   // ImageBitmap 배열
+    let framesReady      = false;
+    let loadingMsg       = '🌷 영상 프레임 로딩 중...';
 
-    // ─── 유틸: 두 랜드마크 사이 거리 ─────────────────────────────────
+    // ─── 프레임 사전 추출 ─────────────────────────────────────────────
+    // video를 1프레임씩 seek하며 ImageBitmap으로 저장
+    async function extractFrames() {
+      await new Promise(resolve => {
+        if (video.readyState >= 1) return resolve();
+        video.addEventListener('loadedmetadata', resolve, { once: true });
+      });
+
+      const duration = video.duration;
+      const fps      = 24;
+      const total    = Math.round(duration * fps);
+
+      flowerCanvas.width  = video.videoWidth  || 1280;
+      flowerCanvas.height = video.videoHeight || 720;
+
+      const offscreen = document.createElement('canvas');
+      offscreen.width  = flowerCanvas.width;
+      offscreen.height = flowerCanvas.height;
+      const offCtx = offscreen.getContext('2d');
+
+      for (let i = 0; i < total; i++) {
+        const t = i / fps;
+        video.currentTime = t;
+        await new Promise(resolve => video.addEventListener('seeked', resolve, { once: true }));
+        offCtx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
+        frames.push(await createImageBitmap(offscreen));
+
+        // 로딩 진행률 표시
+        loadingMsg = `🌷 로딩 중... ${Math.round((i+1)/total*100)}%`;
+      }
+
+      framesReady = true;
+      loadingMsg  = '';
+    }
+
+    video.addEventListener('loadedmetadata', () => extractFrames());
+
+    // ─── 유틸: 두 랜드마크 사이 거리 ────────────────────────────────
     function dist(a, b) {
-      const dx = a.x - b.x;
-      const dy = a.y - b.y;
-      const dz = (a.z || 0) - (b.z || 0);
+      const dx = a.x-b.x, dy = a.y-b.y, dz = (a.z||0)-(b.z||0);
       return Math.sqrt(dx*dx + dy*dy + dz*dz);
     }
 
-    // ─── 손 개방도 계산 ───────────────────────────────────────────────
+    // ─── 손 개방도 계산 ──────────────────────────────────────────────
     function calcOpenness(landmarks) {
-      // 손가락 4개 (검지~소지): [MCP, PIP, DIP, TIP]
-      const fingers = [
-        [5,  6,  7,  8 ],  // 검지
-        [9,  10, 11, 12],  // 중지
-        [13, 14, 15, 16],  // 약지
-        [17, 18, 19, 20],  // 소지
-      ];
-
+      const fingers = [[5,6,7,8],[9,10,11,12],[13,14,15,16],[17,18,19,20]];
       const wrist = landmarks[0];
-      let extendedCount = 0;
-
-      for (const [mcp, pip, , tip] of fingers) {
-        const distTip = dist(landmarks[tip], wrist);
-        const distPip = dist(landmarks[pip], wrist);
-        if (distTip > distPip * 1.1) extendedCount++;
+      let count = 0;
+      for (const [,pip,,tip] of fingers) {
+        if (dist(landmarks[tip], wrist) > dist(landmarks[pip], wrist) * 1.1) count++;
       }
-
-      // 엄지: tip과 mcp 사이 가로 간격
-      const thumbTip = landmarks[4];
-      const thumbMcp = landmarks[2];
-      if (Math.abs(thumbTip.x - thumbMcp.x) > 0.05) extendedCount++;
-
-      return extendedCount / 5; // 0.0 ~ 1.0
+      if (Math.abs(landmarks[4].x - landmarks[2].x) > 0.05) count++;
+      return count / 5;
     }
 
     // ─── 웹캠 캔버스에 랜드마크 그리기 ──────────────────────────────
     function drawCamFrame(landmarks) {
-      // 웹캠 영상 그리기 (미러 없이 — CSS에서 scaleX(-1) 적용)
-      ctx.save();
-      ctx.scale(-1, 1);
-      ctx.drawImage(webcamVideo, -200, 0, 200, 150);
-      ctx.restore();
-
+      ctx.save(); ctx.scale(-1, 1); ctx.drawImage(webcamVideo, -200, 0, 200, 150); ctx.restore();
       if (!landmarks) return;
-
-      // 랜드마크 점 + 연결선
       const W = 200, H = 150;
-
-      // 연결선 (손 뼈대)
       const connections = window.HAND_CONNECTIONS || [
-        [0,1],[1,2],[2,3],[3,4],
-        [0,5],[5,6],[6,7],[7,8],
-        [5,9],[9,10],[10,11],[11,12],
-        [9,13],[13,14],[14,15],[15,16],
-        [13,17],[17,18],[18,19],[19,20],
-        [0,17]
+        [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+        [5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],
+        [13,17],[17,18],[18,19],[19,20],[0,17]
       ];
-
-      ctx.strokeStyle = 'rgba(0, 200, 80, 0.65)';
-      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = 'rgba(0,200,80,0.65)'; ctx.lineWidth = 1.2;
       for (const [a, b] of connections) {
-        const lA = landmarks[a];
-        const lB = landmarks[b];
-        // 미러된 좌표 (CSS scaleX(-1) 보상)
-        const ax = (1 - lA.x) * W;
-        const ay = lA.y * H;
-        const bx = (1 - lB.x) * W;
-        const by = lB.y * H;
+        const lA = landmarks[a], lB = landmarks[b];
         ctx.beginPath();
-        ctx.moveTo(ax, ay);
-        ctx.lineTo(bx, by);
+        ctx.moveTo((1-lA.x)*W, lA.y*H);
+        ctx.lineTo((1-lB.x)*W, lB.y*H);
         ctx.stroke();
       }
-
-      // 랜드마크 점
       for (const lm of landmarks) {
-        const x = (1 - lm.x) * W;
-        const y = lm.y * H;
-        ctx.beginPath();
-        ctx.arc(x, y, 2.5, 0, Math.PI * 2);
-        ctx.fillStyle = '#00ff88';
-        ctx.fill();
+        ctx.beginPath(); ctx.arc((1-lm.x)*W, lm.y*H, 2.5, 0, Math.PI*2);
+        ctx.fillStyle = '#00ff88'; ctx.fill();
       }
     }
 
-    // ─── MediaPipe Hands 설정 ─────────────────────────────────────────
+    // ─── MediaPipe Hands 설정 ────────────────────────────────────────
     const hands = new Hands({
-      locateFile: (file) =>
-        `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
     });
-
     hands.setOptions({
-      maxNumHands: 1,
-      modelComplexity: 1,
-      minDetectionConfidence: 0.7,
-      minTrackingConfidence: 0.6,
+      maxNumHands: 1, modelComplexity: 1,
+      minDetectionConfidence: 0.7, minTrackingConfidence: 0.6,
     });
-
-    hands.onResults((results) => {
+    hands.onResults(results => {
       if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
         latestLandmarks = results.multiHandLandmarks[0];
         handState = 'TRACKING';
@@ -317,61 +307,52 @@
       }
     });
 
-    // ─── 웹캠 스트림 초기화 ───────────────────────────────────────────
+    // ─── 웹캠 스트림 초기화 ──────────────────────────────────────────
     const camera = new Camera(webcamVideo, {
-      onFrame: async () => {
-        await hands.send({ image: webcamVideo });
-      },
-      width: 320,
-      height: 240,
+      onFrame: async () => { await hands.send({ image: webcamVideo }); },
+      width: 320, height: 240,
     });
     camera.start();
 
-    // ─── 메인 애니메이션 루프 ─────────────────────────────────────────
+    // ─── 메인 애니메이션 루프 ────────────────────────────────────────
     function animate() {
       requestAnimationFrame(animate);
 
-      // 1) 손 개방도 계산 및 EMA 스무딩
+      // 1) 손 개방도 EMA 스무딩
       if (handState === 'TRACKING' && latestLandmarks) {
-        const rawOpenness = calcOpenness(latestLandmarks);
-        smoothedOpenness += (rawOpenness - smoothedOpenness) * ALPHA;
+        const raw = calcOpenness(latestLandmarks);
+        smoothedOpenness += (raw - smoothedOpenness) * ALPHA;
       } else {
-        // NO_HAND: 서서히 봉오리로
         smoothedOpenness *= DECAY_RATE;
         if (smoothedOpenness < 0.001) smoothedOpenness = 0;
       }
 
-      // 2) currentTime lerp
-      const dur = video.duration || 1;
-      const targetTime = smoothedOpenness * dur;
-      currentDisplayTime += (targetTime - currentDisplayTime) * LERP_TIME;
-
-      // fastSeek 지원 브라우저는 fastSeek 사용 (더 부드러움)
-      const t = Math.max(0, Math.min(dur, currentDisplayTime));
-      try {
-        if (typeof video.fastSeek === 'function') {
-          video.fastSeek(t);
-        } else {
-          video.currentTime = t;
-        }
-      } catch (e) {
-        // seeked 중 발생할 수 있는 DOMException 무시
+      // 2) 프레임 인덱스 lerp (소수점 → 부드럽게)
+      if (framesReady && frames.length > 0) {
+        const targetIndex = smoothedOpenness * (frames.length - 1);
+        smoothedIndex += (targetIndex - smoothedIndex) * 0.18;
+        const idx = Math.round(Math.max(0, Math.min(frames.length - 1, smoothedIndex)));
+        flowerCtx.drawImage(frames[idx], 0, 0);
+      } else {
+        // 로딩 중 메시지
+        flowerCtx.fillStyle = '#000';
+        flowerCtx.fillRect(0, 0, flowerCanvas.width, flowerCanvas.height);
+        flowerCtx.fillStyle = 'rgba(255,255,255,0.7)';
+        flowerCtx.font = '24px Georgia';
+        flowerCtx.textAlign = 'center';
+        flowerCtx.fillText(loadingMsg, flowerCanvas.width/2, flowerCanvas.height/2);
       }
 
       // 3) 웹캠 캔버스 업데이트
       drawCamFrame(latestLandmarks);
 
-      // 4) 게이지 UI 업데이트
+      // 4) 게이지 업데이트
       const pct = Math.round(smoothedOpenness * 100);
       gaugeBar.style.width = pct + '%';
       gaugePercent.textContent = pct + '%';
 
       // 5) 상태 메시지
-      if (handState === 'NO_HAND') {
-        noHandMsg.textContent = '✋ 화면에 손을 보여주세요';
-      } else {
-        noHandMsg.textContent = '';
-      }
+      noHandMsg.textContent = handState === 'NO_HAND' ? '✋ 화면에 손을 보여주세요' : '';
     }
 
     animate();
