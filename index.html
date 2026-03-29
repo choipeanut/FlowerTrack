@@ -210,17 +210,12 @@
     let framesReady      = false;
     let loadingMsg       = '🌷 영상 프레임 로딩 중...';
 
-    // ─── 프레임 사전 추출 ─────────────────────────────────────────────
-    // video를 1프레임씩 seek하며 ImageBitmap으로 저장
+    // ─── 프레임 사전 추출 (재생하면서 캡처 → 빠름) ──────────────────
     async function extractFrames() {
       await new Promise(resolve => {
         if (video.readyState >= 1) return resolve();
         video.addEventListener('loadedmetadata', resolve, { once: true });
       });
-
-      const duration = video.duration;
-      const fps      = 24;
-      const total    = Math.round(duration * fps);
 
       flowerCanvas.width  = video.videoWidth  || 1280;
       flowerCanvas.height = video.videoHeight || 720;
@@ -230,17 +225,31 @@
       offscreen.height = flowerCanvas.height;
       const offCtx = offscreen.getContext('2d');
 
-      for (let i = 0; i < total; i++) {
-        const t = i / fps;
-        video.currentTime = t;
-        await new Promise(resolve => video.addEventListener('seeked', resolve, { once: true }));
-        offCtx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
-        frames.push(await createImageBitmap(offscreen));
+      video.currentTime = 0;
+      await new Promise(r => video.addEventListener('seeked', r, { once: true }));
 
-        // 로딩 진행률 표시
-        loadingMsg = `🌷 로딩 중... ${Math.round((i+1)/total*100)}%`;
-      }
+      let lastCapturedTime = -1;
 
+      await new Promise(resolve => {
+        function captureLoop() {
+          if (video.ended || video.currentTime >= video.duration - 0.01) {
+            resolve(); return;
+          }
+          const t = video.currentTime;
+          if (t - lastCapturedTime >= 1/30) {   // 30fps 간격으로 캡처
+            offCtx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
+            createImageBitmap(offscreen).then(bmp => frames.push(bmp));
+            lastCapturedTime = t;
+            loadingMsg = `🌷 로딩 중... ${Math.round(t / video.duration * 100)}%`;
+          }
+          requestAnimationFrame(captureLoop);
+        }
+        video.play();
+        requestAnimationFrame(captureLoop);
+        video.addEventListener('ended', resolve, { once: true });
+      });
+
+      video.pause();
       framesReady = true;
       loadingMsg  = '';
     }
